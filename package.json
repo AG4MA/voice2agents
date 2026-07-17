@@ -1,0 +1,111 @@
+{
+  "name": "voice2agents",
+  "displayName": "Voice2Agents — conversazione a voce con Codex (Spark locale)",
+  "description": "Click sul pulsante, scegli la chat di Codex, parte l'ascolto fisso: parli e invia, lui ti risponde a voce. STT/TTS sulla DGX Spark. Tutto in locale, zero cloud.",
+  "version": "0.13.5",
+  "publisher": "AG4MA",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "voice2agents.toggle",
+        "title": "Voice2Agents: collega una chat di Codex / STOP totale"
+      },
+      {
+        "command": "voice2agents.pickSession",
+        "title": "Voice2Agents: scegli la chat di Codex"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "voice2agents.toggle",
+        "key": "ctrl+alt+v"
+      }
+    ],
+    "configuration": {
+      "title": "Voice2Agents",
+      "properties": {
+        "voice2agents.backendUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8900",
+          "description": "voice_server sulla Spark, raggiunto via tunnel SSH locale"
+        },
+        "voice2agents.language": {
+          "type": "string",
+          "default": "it",
+          "description": "Lingua della trascrizione"
+        },
+        "voice2agents.silenceDb": {
+          "type": "string",
+          "default": "-35dB",
+          "description": "Soglia di rumore sotto cui e' silenzio"
+        },
+        "voice2agents.silenceSec": {
+          "type": "number",
+          "default": 0.8,
+          "description": "Secondi di silenzio che chiudono una frase"
+        },
+        "voice2agents.minSpeechSec": {
+          "type": "number",
+          "default": 0.35,
+          "description": "Parlato minimo perche' un pezzo venga trascritto (basso: anche un 'si'' passa)"
+        },
+        "voice2agents.beep": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bip di conferma quando una frase viene capita (spento: esperienza solo voce)"
+        },
+        "voice2agents.attesaInvioSec": {
+          "type": "number",
+          "default": 5,
+          "description": "Silenzio dopo un discorso lungo e COMPIUTO prima dell'invio (le frasi sospese non partono mai da sole)"
+        },
+        "voice2agents.attesaEstesaSec": {
+          "type": "number",
+          "default": 60,
+          "description": "Quanto resta viva la bozza dopo che dici 'aspetta'"
+        },
+        "voice2agents.maxChunkSec": {
+          "type": "number",
+          "default": 45,
+          "description": "Taglio forzato se parli piu' a lungo di cosi'"
+        },
+        "voice2agents.bargeIn": {
+          "type": "boolean",
+          "default": false,
+          "description": "Se parli mentre Codex parla, lui si zittisce. Attivalo con le CUFFIE: con le casse si interromperebbe da solo sentendo la propria voce"
+        },
+        "voice2agents.voceCodex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Leggi a voce le risposte di Codex (Kokoro sulla Spark)"
+        },
+        "voice2agents.tunnelEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mantieni da solo il tunnel SSH verso la Spark"
+        },
+        "voice2agents.tunnelHost": {
+          "type": "string",
+          "default": "",
+          "description": "Account e host SSH del tunnel verso il server voce, es. voice-tunnel@100.x.y.z (utente dedicato, solo forward 8900)"
+        },
+        "voice2agents.tunnelKeyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Chiave SSH del tunnel; vuoto = %USERPROFILE%\\.ssh\\spark_tunnel_key"
+        }
+      }
+    }
+  }
+}
