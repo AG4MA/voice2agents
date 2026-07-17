@@ -30,6 +30,8 @@ let statusBar;
 let output;
 let connectedTo = null;   // percorso della sessione collegata; null = scollegato
 let connectedLabel = "";
+let connectedMode = "codex"; // "codex" (exec resume) | "claude" (terminale Claude Code)
+let claudeTerm = null;    // Terminal VSCode della chat Claude Code collegata
 let connectedUuid = "";   // UUID della sessione: destinazione di `codex exec resume`
 let connectedCwd = "";    // cwd della sessione, usato come working dir dell'exec
 let codexExe = null;
@@ -49,6 +51,11 @@ let ffmpegCmd = null;
 let micName = null;
 let playbackCount = 0;
 let playbackProc = null;
+// Barge-in a livello: mentre LEI parla, si misura l'eco al microfono; se il volume
+// supera nettamente quell'eco, è LUI che parla sopra → lei si ferma. Lui comanda.
+let bargeEma = 0;
+let bargeRunMs = 0;
+let bargeWarmupUntil = 0;
 const allPlayers = new Set();
 let recentTts = [];
 let spokenRecently = new Map();
@@ -241,7 +248,26 @@ function processFrame(buf, off) {
   const v = vad;
   if (!v || !connected()) return;
   const frame = Buffer.from(buf.slice(off, off + FRAME_BYTES));
-  const voiced = frameRms(buf, off) > silenceThreshold();
+  const rms = frameRms(buf, off);
+  const voiced = rms > silenceThreshold();
+
+  // Interruzione parlandoci sopra (anche con le casse): baseline adattiva dell'eco.
+  if (playbackCount > 0 && Date.now() > bargeWarmupUntil) {
+    bargeEma = bargeEma * 0.92 + rms * 0.08;
+    const gate = Math.max(silenceThreshold() * 2.5, bargeEma * 2.3);
+    if (rms > gate) {
+      bargeRunMs += FRAME_MS;
+      if (bargeRunMs >= 80) {
+        bargeRunMs = 0;
+        fermaLettura();
+        playbackCount = 0; // eco finita: la parola è tua, subito
+        if (v.inSpeech) v.tainted = false; // quello che stai dicendo VALE
+        log("Ti sei sovrapposto: mi fermo, parla pure");
+      }
+    } else {
+      bargeRunMs = Math.max(0, bargeRunMs - FRAME_MS);
+    }
+  }
 
   if (!v.inSpeech) {
     v.preroll.push(frame);
@@ -286,11 +312,11 @@ function processFrame(buf, off) {
 function finishSegment(seg) {
   if (!connected()) return;
   if (seg.speechMs < cfg().get("minSpeechSec", 0.6) * 1000) return;
-  // Anche i segmenti "sporchi" (registrati mentre parlava lui) si trascrivono:
-  // servono a captare "basta/zitto" detto sopra la sua voce. Non vanno mai in chat.
+  // TUTTO si trascrive, anche i pezzi registrati mentre parlava lei: l'eco della
+  // sua voce si riconosce dal contenuto (isEchoOfTts) e si butta; il resto è TUO
+  // — comandi compresi ("invia", "aspetta" sopra la sua voce ora valgono).
   const wav = pcmToWav(Buffer.concat(seg.frames));
-  const soloStop = !!seg.tainted;
-  transcribeQueue = transcribeQueue.then(() => transcribeSegment(wav, soloStop)).catch(() => {});
+  transcribeQueue = transcribeQueue.then(() => transcribeSegment(wav)).catch(() => {});
 }
 
 function pcmToWav(pcm) {
@@ -311,7 +337,7 @@ function pcmToWav(pcm) {
   return Buffer.concat([header, pcm]);
 }
 
-async function transcribeSegment(wav, soloStop = false) {
+async function transcribeSegment(wav) {
   if (!connected()) return;
   try {
     setStatus("elaboro");
@@ -328,12 +354,6 @@ async function transcribeSegment(wav, soloStop = false) {
     const sttMs = Date.now() - t0;
     if (!text) { log(`STT ${sttMs}ms: (vuoto)`); return; }
     if (!connected()) return; // scollegato mentre trascriveva: non mandare nulla
-    if (soloStop) {
-      // Registrato mentre lui parlava: vale SOLO come eventuale "basta".
-      if (comandoStop(normalizza(text))) { log(`STOP a voce sopra la lettura: "${text}"`); fermaLettura(); }
-      else log(`(sovrapposto alla voce, ignorato) "${text}"`);
-      return;
-    }
     if (isEchoOfTts(text)) { log(`STT ${sttMs}ms, eco scartata: "${text}"`); return; }
     log(`STT ${sttMs}ms — TU → "${text}"`);
     beep(880, 120); // ti ho sentito: parte l'invio
@@ -694,6 +714,29 @@ function ensureChatPanel() {
 // indipendente da cursore/focus — l'utente può fare altro mentre parla.
 // La conversazione si VEDE nel pannello nostro (aggiornato dal rollout).
 function sendMessage(text) {
+  if (connectedMode === "claude") {
+    // Chat di Claude Code = terminale vero: il testo entra NELLA chat che guardi,
+    // invio nativo, nessun focus toccato, nessun processo esterno.
+    sendQueue = sendQueue.then(() => {
+      if (!connected() || !claudeTerm) return;
+      try {
+        claudeTerm.sendText(text, true);
+        if (codexWatch) {
+          codexWatch.afterSendUntil = Date.now() + 30000;
+          codexWatch.sendDetected = false;
+          // Frammento senza caratteri che JSON escampa: serve a riconoscere il transcript giusto.
+          codexWatch.expectText = text.replace(/["\\\n\r]/g, " ").replace(/\s+/g, " ").trim().slice(0, 30);
+        }
+        log("Inviato nella chat Claude Code");
+        postChat("sys", "⏳ inviato");
+      } catch (e) {
+        log(`Invio a Claude Code fallito: ${e.message}`);
+        pendingTexts.unshift(text);
+        postChat("sys", "⚠ invio fallito: testo tenuto in bozza");
+      }
+    }).catch(() => {});
+    return Promise.resolve();
+  }
   sendQueue = sendQueue.then(() => new Promise((resolve) => {
     if (!connected()) { resolve(); return; }
     let exe;
@@ -821,9 +864,21 @@ function sessionLabel(file) {
 }
 
 async function pickAndConnect() {
+  const items = [];
+
+  // Chat di Claude Code = terminali VSCode: integrazione piena (si scrive DENTRO).
+  const termini = vscode.window.terminals || [];
+  const claude = termini.filter((t) => /claude/i.test(t.name || ""));
+  const altriTerm = termini.filter((t) => !/claude/i.test(t.name || ""));
+  if (claude.length || altriTerm.length) {
+    items.push({ label: "Claude Code (terminali)", kind: vscode.QuickPickItemKind.Separator });
+    for (const t of claude) items.push({ label: `$(terminal) ${t.name}`, description: "Claude Code", term: t });
+    for (const t of altriTerm.slice(0, 4)) items.push({ label: `$(terminal) ${t.name}`, description: "terminale", term: t });
+  }
+
   const rollouts = listRecentRollouts(14); // due settimane: le chat con titolo possono essere vecchie
-  if (!rollouts.length) {
-    vscode.window.showWarningMessage(`${EXT}: nessuna chat Codex trovata. Apri Codex, avvia una chat e riprova.`);
+  if (!rollouts.length && !items.length) {
+    vscode.window.showWarningMessage(`${EXT}: nessuna chat trovata. Apri Codex o un terminale Claude Code e riprova.`);
     return;
   }
   const byUuid = new Map();
@@ -832,8 +887,8 @@ async function pickAndConnect() {
     if (u && !byUuid.has(u)) byUuid.set(u, r); // il più recente vince (lista già ordinata)
   }
   const index = readSessionIndex();
-  const items = [];
   const usati = new Set();
+  items.push({ label: "Codex (sessioni)", kind: vscode.QuickPickItemKind.Separator });
 
   // 1) Le chat coi TITOLI veri (come nella history di Codex), più recenti in alto.
   const titolate = [...index.entries()]
@@ -875,10 +930,43 @@ async function pickAndConnect() {
     return;
   }
   const sel = await vscode.window.showQuickPick(items, {
-    placeHolder: "A quale chat di Codex mi collego?",
+    placeHolder: "A quale chat mi collego? (Claude Code = integrazione piena)",
   });
-  if (!sel || !sel.file) return;
-  await connectTo(sel.file);
+  if (!sel) return;
+  if (sel.term) { await connectToClaude(sel.term); return; }
+  if (sel.file) await connectTo(sel.file);
+}
+
+// Collegamento a una chat di Claude Code (terminale): si scrive DENTRO la chat vera.
+async function connectToClaude(term) {
+  try {
+    findFfmpeg();
+    await detectMicrophone();
+  } catch (e) {
+    setStatusError(e.message);
+    vscode.window.showErrorMessage(`${EXT}: ${e.message}`);
+    return;
+  }
+  connectedMode = "claude";
+  claudeTerm = term;
+  connectedTo = `claude:${term.name}`;
+  connectedUuid = "";
+  connectedCwd = "";
+  connectedLabel = term.name;
+  startCodexWatcher(null, "claude"); // il transcript giusto si identifica al primo invio
+  startTunnelWatchdog();
+  await startAudio();
+  ensureChatPanel();
+  postChat("sys", `— Collegato a: ${connectedLabel} (Claude Code) —`);
+  refreshStatus();
+  log(`COLLEGATO a: ${connectedLabel} (Claude Code) — parla pure`);
+  speakChain = speakChain.then(async () => {
+    for (let i = 0; i < 20; i++) {
+      if (await portReachable(backendPort())) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    await playTts(`Collegato a ${connectedLabel}. Dimmi pure.`);
+  }).catch(() => {});
 }
 
 function sessionCwd(file) {
@@ -935,6 +1023,8 @@ async function connectTo(file) {
 function stopAll() {
   connectedTo = null;
   connectedLabel = "";
+  connectedMode = "codex";
+  claudeTerm = null;
   connectedUuid = "";
   connectedCwd = "";
   sendQueue = Promise.resolve();
@@ -967,12 +1057,37 @@ async function toggle() {
 
 // ── Voce di Codex: watcher sulla sessione scelta + TTS ─────
 
-function startCodexWatcher(file) {
+// Cartella dei transcript Claude Code per il workspace corrente
+// (es. c:\projects → ~/.claude/projects/c--projects).
+function claudeProjectDir() {
+  const ws = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
+  const base = ws ? ws.uri.fsPath : "c:\\projects";
+  const san = base.replace(/[:\\/]/g, "-").toLowerCase();
+  return path.join(process.env.USERPROFILE || "", ".claude", "projects", san);
+}
+
+function listClaudeTranscripts() {
+  const dir = claudeProjectDir();
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { return []; }
+  const all = [];
+  for (const name of entries) {
+    if (!name.endsWith(".jsonl")) continue;
+    const full = path.join(dir, name);
+    let st;
+    try { st = fs.statSync(full); } catch { continue; }
+    all.push({ file: full, mtimeMs: st.mtimeMs, size: st.size });
+  }
+  return all.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+function startCodexWatcher(file, mode = "codex") {
   stopCodexWatcher();
   let size = 0;
-  try { size = fs.statSync(file).size; } catch {}
+  if (file) { try { size = fs.statSync(file).size; } catch {} }
   codexWatch = {
-    file,
+    mode,                 // "codex" | "claude"
+    file,                 // in modalità claude può essere null finché il primo invio non identifica il transcript
     offset: size, // solo quello che arriva DA ORA: mai lo storico
     carry: "",
     lastSizes: new Map(), // dimensioni note dei rollout recenti: chi cresce è la chat viva
@@ -980,6 +1095,7 @@ function startCodexWatcher(file) {
     dirRescanAt: 0,
     afterSendUntil: 0,    // finestra post-invio per agganciare la chat a schermo
     sendDetected: true,
+    expectText: "",       // claude: frammento del testo inviato, per riconoscere il transcript giusto
     timer: setInterval(codexWatchTick, 500),
   };
 }
@@ -1001,6 +1117,8 @@ function extractUserText(obj) {
     if (role === "user" && Array.isArray(content)) {
       const parts = content.filter((c) => c && typeof c.text === "string").map((c) => c.text);
       if (parts.length) t = parts.join(" ");
+    } else if (role === "user" && typeof content === "string") {
+      t = content; // transcript Claude Code: contenuto utente come stringa
     }
   }
   if (!t) return null;
@@ -1038,10 +1156,12 @@ function codexWatchTick() {
   const w = codexWatch;
   if (!w || !connected()) return;
   const now = Date.now();
-  // Censimento dei rollout recenti (cache 5s): chi cresce è la chat davvero attiva.
+  // Censimento dei file recenti (cache 5s): chi cresce è la chat davvero attiva.
   if (now >= w.dirRescanAt) {
     w.dirRescanAt = now + 5000;
-    w.recent = listRecentRollouts(2).slice(0, 25).map((r) => r.file);
+    w.recent = (w.mode === "claude"
+      ? listClaudeTranscripts().slice(0, 25)
+      : listRecentRollouts(2).slice(0, 25)).map((r) => r.file);
   }
   for (const f of w.recent) {
     let stf;
@@ -1051,21 +1171,39 @@ function codexWatchTick() {
     if (prev === undefined || stf.size <= prev) continue;
     if (f === w.file) { w.sendDetected = true; continue; }
     if (now < w.afterSendUntil) {
-      // Subito dopo un NOSTRO invio è cresciuta UN'ALTRA sessione: la chat a schermo
-      // è quella — la voce si sposta lì e continua da quel punto (niente storico).
+      if (w.mode === "claude") {
+        // Nella cartella girano ANCHE altre sessioni Claude: si adotta un transcript
+        // solo se il pezzo cresciuto contiene il testo che abbiamo appena inviato.
+        if (!w.expectText) continue;
+        let frag = "";
+        try {
+          const fd = fs.openSync(f, "r");
+          const len = Math.min(stf.size - prev, 262144);
+          const b = Buffer.alloc(len);
+          fs.readSync(fd, b, 0, len, prev);
+          fs.closeSync(fd);
+          frag = b.toString("utf8");
+        } catch { continue; }
+        if (!frag.includes(w.expectText)) continue;
+        log("Transcript della chat Claude identificato");
+      }
+      // La chat viva è QUESTA — la voce si sposta lì e continua da quel punto.
       w.sendDetected = true;
       w.file = f;
       w.offset = prev;
       w.carry = "";
-      const t = readSessionIndex().get(rolloutUuid(f));
-      const nuova = t ? t.name : sessionLabel(f);
-      if (nuova !== connectedLabel) {
-        log(`La chat a schermo è "${nuova}", non quella scelta dalla lista: ti seguo lì`);
-        connectedLabel = nuova;
-        refreshStatus();
+      if (w.mode === "codex") {
+        const t = readSessionIndex().get(rolloutUuid(f));
+        const nuova = t ? t.name : sessionLabel(f);
+        if (nuova !== connectedLabel) {
+          log(`La chat a schermo è "${nuova}", non quella scelta dalla lista: ti seguo lì`);
+          connectedLabel = nuova;
+          refreshStatus();
+        }
       }
     }
   }
+  if (!w.file) return; // claude: in attesa del primo invio per identificare il transcript
   let st;
   try { st = fs.statSync(w.file); } catch { return; }
   if (st.size <= w.offset) return;
@@ -1161,6 +1299,10 @@ async function playTts(testo) {
       }
       playbackProc = p;
       allPlayers.add(p);
+      // Il rilevatore di sovrapposizione parte dopo 700ms: il tempo di tarare l'eco.
+      bargeEma = silenceThreshold() * 1.5;
+      bargeRunMs = 0;
+      bargeWarmupUntil = Date.now() + 700;
       p.on("close", () => { allPlayers.delete(p); resolve(); });
       p.on("error", () => { allPlayers.delete(p); resolve(); });
       setTimeout(resolve, 180000);
@@ -1229,6 +1371,12 @@ function activate(context) {
   context.subscriptions.push(statusBar, output);
   context.subscriptions.push(vscode.commands.registerCommand("voice2agents.toggle", toggle));
   context.subscriptions.push(vscode.commands.registerCommand("voice2agents.pickSession", pickAndConnect));
+  context.subscriptions.push(vscode.window.onDidCloseTerminal((t) => {
+    if (claudeTerm && t === claudeTerm) {
+      log("Il terminale Claude Code collegato è stato chiuso");
+      stopAll();
+    }
+  }));
 }
 
 function deactivate() {
