@@ -700,7 +700,13 @@ function sendMessage(text) {
     try { exe = findCodexExe(); } catch (e) { setStatusError(e.message); resolve(); return; }
     const uuid = connectedUuid;
     log("Invio alla chat (indipendente dal tuo cursore)");
-    const child = spawn(exe, ["exec", "resume", "--skip-git-repo-check", uuid, text], {
+    const args = ["exec", "resume", "--skip-git-repo-check"];
+    const modello = String(cfg().get("model", "") || "").trim();
+    if (modello) args.push("-c", `model="${modello}"`);
+    const effort = String(cfg().get("reasoningEffort", "") || "").trim();
+    if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
+    args.push(uuid, text);
+    const child = spawn(exe, args, {
       cwd: connectedCwd && fs.existsSync(connectedCwd) ? connectedCwd : undefined,
       stdio: ["ignore", "ignore", "pipe"],
       windowsHide: true,
