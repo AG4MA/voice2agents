@@ -59,6 +59,8 @@ let speakChain = Promise.resolve();
 let errorUntil = 0;
 let codexWatch = null;
 let extVersion = "?";
+let chatPanel = null;
+let chatLog = []; // { role: 'user'|'assistant'|'sys', text }
 
 function cfg() {
   return vscode.workspace.getConfiguration("voice2agents");
@@ -631,16 +633,66 @@ function deliverText(text) {
   return Promise.resolve();
 }
 
-// Invio DIRETTO nella sessione scelta (codex exec resume): completamente
-// indipendente da cursore/focus — l'utente può fare altro mentre parla.
-// Il pannello viene rinfrescato (rotta /local/<uuid>) dopo l'invio e a fine
-// turno, così la chat a video mostra i messaggi.
-function refreshPanel(uuid) {
-  try {
-    vscode.env.openExternal(vscode.Uri.parse(`vscode://openai.chatgpt/local/${uuid}`)).then(undefined, () => {});
-  } catch { /* pannello non disponibile */ }
+// ── Pannello conversazione dell'estensione ─────────────────
+// Il pannello di Codex non si aggiorna dall'esterno: questo è NOSTRO, vive sul
+// file di sessione (stessa fonte della voce) e mostra tutto in tempo reale.
+// La casella in fondo scrive nella stessa sessione degli invii vocali.
+
+function postChat(role, text) {
+  chatLog.push({ role, text });
+  if (chatLog.length > 300) chatLog.shift();
+  if (chatPanel) { try { chatPanel.webview.postMessage({ type: "msg", role, text }); } catch {} }
 }
 
+function ensureChatPanel() {
+  if (chatPanel) {
+    try { chatPanel.title = connectedLabel || "Conversazione"; chatPanel.reveal(undefined, true); } catch {}
+    return;
+  }
+  chatPanel = vscode.window.createWebviewPanel(
+    "voice2agentsChat",
+    connectedLabel || "Conversazione",
+    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
+    { enableScripts: true, retainContextWhenHidden: true }
+  );
+  chatPanel.webview.html = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+  body{font-family:var(--vscode-font-family);padding:0;margin:0;background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);display:flex;flex-direction:column;height:100vh}
+  #log{flex:1;overflow-y:auto;padding:10px}
+  .m{margin:6px 0;padding:8px 10px;border-radius:8px;white-space:pre-wrap;word-wrap:break-word;max-width:92%;font-size:13px;line-height:1.45}
+  .user{background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-left:auto}
+  .assistant{background:var(--vscode-editorWidget-background);border:1px solid var(--vscode-widget-border,#444)}
+  .sys{opacity:.65;font-style:italic;text-align:center;background:none;font-size:12px}
+  #bar{display:flex;padding:8px;gap:6px;border-top:1px solid var(--vscode-widget-border,#444)}
+  #inp{flex:1;padding:8px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,#555);border-radius:6px;font-family:inherit}
+  button{padding:8px 14px;border:none;border-radius:6px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);cursor:pointer}
+  </style></head><body>
+  <div id="log"></div>
+  <div id="bar"><input id="inp" placeholder="Scrivi agli agenti (Invio per mandare)"/><button id="btn">Invia</button></div>
+  <script>
+  const vs = acquireVsCodeApi();
+  const log = document.getElementById('log'); const inp = document.getElementById('inp');
+  function add(role, text){ const d = document.createElement('div'); d.className = 'm ' + role; d.textContent = text; log.appendChild(d); log.scrollTop = log.scrollHeight; }
+  window.addEventListener('message', (e) => { const m = e.data; if (m.type === 'msg') add(m.role, m.text); });
+  function send(){ const t = inp.value.trim(); if (!t) return; inp.value = ''; vs.postMessage({ type: 'send', text: t }); }
+  document.getElementById('btn').onclick = send;
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  vs.postMessage({ type: 'ready' });
+  </script></body></html>`;
+  chatPanel.webview.onDidReceiveMessage((m) => {
+    if (!m) return;
+    if (m.type === "ready") {
+      for (const e of chatLog) { try { chatPanel.webview.postMessage({ type: "msg", role: e.role, text: e.text }); } catch {} }
+    } else if (m.type === "send" && typeof m.text === "string" && m.text.trim()) {
+      if (!connected()) { postChat("sys", "Non collegato: premi il bottone e scegli una chat"); return; }
+      sendMessage(m.text.trim());
+    }
+  });
+  chatPanel.onDidDispose(() => { chatPanel = null; });
+}
+
+// Invio DIRETTO nella sessione scelta (codex exec resume): completamente
+// indipendente da cursore/focus — l'utente può fare altro mentre parla.
+// La conversazione si VEDE nel pannello nostro (aggiornato dal rollout).
 function sendMessage(text) {
   sendQueue = sendQueue.then(() => new Promise((resolve) => {
     if (!connected()) { resolve(); return; }
@@ -656,18 +708,17 @@ function sendMessage(text) {
     execChild = child;
     let errTail = "";
     child.stderr.on("data", (d) => { errTail = (errTail + d.toString()).slice(-400); });
-    // Poco dopo la partenza il rollout contiene già il TUO messaggio: refresh del pannello.
-    setTimeout(() => { if (connected() && connectedUuid === uuid) refreshPanel(uuid); }, 1500);
+    postChat("sys", "⏳ in lavorazione…");
     const killer = setTimeout(() => { try { child.kill(); } catch {} }, 30 * 60 * 1000);
     child.on("close", (code) => {
       clearTimeout(killer);
       if (execChild === child) execChild = null;
       if (code === 0) {
         log("Turno completato");
-        if (connected() && connectedUuid === uuid) refreshPanel(uuid);
       } else if (connected()) {
         log(`Invio fallito (exit ${code}): ${errTail.split("\n").slice(-2).join(" ")}`);
         pendingTexts.unshift(text); // mai perdere nulla: torna in bozza
+        postChat("sys", "⚠ invio fallito: testo tenuto in bozza");
         speakChain = speakChain.then(() => playTts("Non sono riuscito a inviare: tengo il messaggio da parte, dimmi invia per riprovare.")).catch(() => {});
       }
       resolve();
@@ -858,10 +909,9 @@ async function connectTo(file) {
   startCodexWatcher(file);
   startTunnelWatchdog();
   await startAudio();
-  // Apri SUBITO la conversazione scelta nel pannello Codex (rotta /local/<uuid>).
-  try {
-    await vscode.env.openExternal(vscode.Uri.parse(`vscode://openai.chatgpt/local/${connectedUuid}`));
-  } catch (e) { log(`Apertura chat fallita: ${e.message}`); }
+  // Pannello conversazione NOSTRO: live sul file di sessione, non ruba mai il focus.
+  ensureChatPanel();
+  postChat("sys", `— Collegato a: ${connectedLabel} —`);
   refreshStatus();
   log(`COLLEGATO a: ${connectedLabel} — chat aperta nel pannello, parla pure`);
   vscode.window.setStatusBarMessage(`$(broadcast) Collegato: ${connectedLabel} — parla pure`, 5000);
@@ -899,6 +949,7 @@ function stopAll() {
   retryQueue = [];
   stopCodexWatcher();
   refreshStatus();
+  postChat("sys", "— Scollegato —");
   log("STOP TOTALE: scollegato, mic chiuso, voce zittita");
   vscode.window.setStatusBarMessage("$(mute) Voce Codex FERMATA", 3000);
 }
@@ -931,6 +982,35 @@ function stopCodexWatcher() {
   if (!codexWatch) return;
   clearInterval(codexWatch.timer);
   codexWatch = null;
+}
+
+function extractUserText(obj) {
+  const p = obj && obj.payload ? obj.payload : obj;
+  if (!p) return null;
+  let t = null;
+  if (p.type === "user_message" && typeof p.message === "string") t = p.message;
+  else {
+    const role = p.role || (p.message && p.message.role);
+    const content = p.content || (p.message && p.message.content);
+    if (role === "user" && Array.isArray(content)) {
+      const parts = content.filter((c) => c && typeof c.text === "string").map((c) => c.text);
+      if (parts.length) t = parts.join(" ");
+    }
+  }
+  if (!t) return null;
+  t = t.trim();
+  if (!t || t.startsWith("<") || t.length > 4000) return null; // instructions/environment
+  return t;
+}
+
+const shownRecently = new Map(); // dedup pannello: il rollout scrive doppioni
+function giaMostrato(text) {
+  const key = normalizeWords ? normalizeWords(text).join(" ") : text;
+  const now = Date.now();
+  for (const [k, ts] of shownRecently) { if (now - ts > 120000) shownRecently.delete(k); }
+  if (shownRecently.has(key)) return true;
+  shownRecently.set(key, now);
+  return false;
 }
 
 function extractAssistantText(obj) {
@@ -997,8 +1077,13 @@ function codexWatchTick() {
       if (!line.trim()) continue;
       let obj;
       try { obj = JSON.parse(line); } catch { continue; }
-      const text = extractAssistantText(obj);
-      if (text) speakText(text);
+      const at = extractAssistantText(obj);
+      if (at) {
+        if (!giaMostrato(at)) { postChat("assistant", at); speakText(at); }
+        continue;
+      }
+      const ut = extractUserText(obj);
+      if (ut && !giaMostrato(ut)) postChat("user", ut);
     }
   } catch (e) {
     log(`Watcher Codex: ${e.message}`);
