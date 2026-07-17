@@ -737,48 +737,49 @@ function sendMessage(text) {
     }).catch(() => {});
     return Promise.resolve();
   }
-  sendQueue = sendQueue.then(() => new Promise((resolve) => {
-    if (!connected()) { resolve(); return; }
-    let exe;
-    try { exe = findCodexExe(); } catch (e) { setStatusError(e.message); resolve(); return; }
-    const uuid = connectedUuid;
-    log("Invio alla chat (indipendente dal tuo cursore)");
-    const args = ["exec", "resume", "--skip-git-repo-check"];
-    const modello = String(cfg().get("model", "") || "").trim();
-    if (modello) args.push("-c", `model="${modello}"`);
-    const effort = String(cfg().get("reasoningEffort", "") || "").trim();
-    if (effort) args.push("-c", `model_reasoning_effort="${effort}"`);
-    args.push(uuid, text);
-    const child = spawn(exe, args, {
-      cwd: connectedCwd && fs.existsSync(connectedCwd) ? connectedCwd : undefined,
-      stdio: ["ignore", "ignore", "pipe"],
-      windowsHide: true,
+  // Codex: invio UI nella chat VERA col "prestito di focus" — deep link sulla
+  // conversazione, incolla+Invio nel suo composer, e il cursore torna subito
+  // dov'era (file, riga, selezione). Nessun turno fuori banda: è come se avessi
+  // digitato tu, quindi niente doppio pilota.
+  sendQueue = sendQueue.then(async () => {
+    if (!connected()) return;
+    const prevEditor = vscode.window.activeTextEditor;
+    const prevSel = prevEditor ? prevEditor.selection : null;
+    const prevCol = prevEditor ? prevEditor.viewColumn : undefined;
+    await vscode.env.clipboard.writeText(text);
+    try { await vscode.env.openExternal(vscode.Uri.parse(`vscode://openai.chatgpt/local/${connectedUuid}`)); } catch {}
+    await new Promise((r) => setTimeout(r, 650));
+    for (const cmd of ["workbench.action.focusAuxiliaryBar", "chatgpt.sidebarSecondaryView.focus", "chatgpt.sidebarView.focus"]) {
+      try { await vscode.commands.executeCommand(cmd); break; } catch { /* prossimo */ }
+    }
+    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((res) => {
+      const p = spawn("powershell.exe", [
+        "-NoProfile", "-STA", "-Command",
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v{ENTER}')",
+      ], { stdio: "ignore", windowsHide: true });
+      p.on("close", res);
+      p.on("error", res);
+      setTimeout(res, 3000);
     });
-    execChild = child;
-    let errTail = "";
-    child.stderr.on("data", (d) => { errTail = (errTail + d.toString()).slice(-400); });
-    postChat("sys", "⏳ in lavorazione…");
-    const killer = setTimeout(() => { try { child.kill(); } catch {} }, 30 * 60 * 1000);
-    child.on("close", (code) => {
-      clearTimeout(killer);
-      if (execChild === child) execChild = null;
-      if (code === 0) {
-        log("Turno completato");
-      } else if (connected()) {
-        log(`Invio fallito (exit ${code}): ${errTail.split("\n").slice(-2).join(" ")}`);
-        pendingTexts.unshift(text); // mai perdere nulla: torna in bozza
-        postChat("sys", "⚠ invio fallito: testo tenuto in bozza");
-        speakChain = speakChain.then(() => playTts("Non sono riuscito a inviare: tengo il messaggio da parte, dimmi invia per riprovare.")).catch(() => {});
-      }
-      resolve();
-    });
-    child.on("error", (e) => {
-      clearTimeout(killer);
-      if (execChild === child) execChild = null;
-      log(`Invio fallito: ${e.message}`);
-      resolve();
-    });
-  })).catch(() => {});
+    // Restituzione del focus al punto esatto in cui stavi lavorando.
+    if (prevEditor) {
+      try { await vscode.window.showTextDocument(prevEditor.document, { viewColumn: prevCol, selection: prevSel, preserveFocus: false }); } catch {}
+    }
+    if (codexWatch) {
+      codexWatch.afterSendUntil = Date.now() + 20000;
+      codexWatch.sendDetected = false;
+      setTimeout(() => {
+        const w = codexWatch;
+        if (w && !w.sendDetected && connected()) {
+          pendingTexts.unshift(text); // mai perso: torna in bozza
+          postChat("sys", "⚠ invio non atterrato: testo in bozza");
+          speakChain = speakChain.then(() => playTts("Non vedo la chat muoversi: tengo il messaggio da parte, dimmi invia per riprovare.")).catch(() => {});
+        }
+      }, 15000);
+    }
+    log("Inviato nella chat Codex (focus preso in prestito e restituito)");
+  }).catch(() => {});
   return Promise.resolve();
 }
 
