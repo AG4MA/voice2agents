@@ -631,44 +631,54 @@ function deliverText(text) {
   return Promise.resolve();
 }
 
-// Invio NELLA CHAT APERTA nel pannello Codex (incolla+Invio): la vedi aggiornarsi
-// a schermo e l'agente risponde col contesto caldo (niente resume lento). Subito
-// dopo l'invio, il file di sessione che CRESCE è la chat a schermo: la voce legge da lì.
+// Invio DIRETTO nella sessione scelta (codex exec resume): completamente
+// indipendente da cursore/focus — l'utente può fare altro mentre parla.
+// Il pannello viene rinfrescato (rotta /local/<uuid>) dopo l'invio e a fine
+// turno, così la chat a video mostra i messaggi.
+function refreshPanel(uuid) {
+  try {
+    vscode.env.openExternal(vscode.Uri.parse(`vscode://openai.chatgpt/local/${uuid}`)).then(undefined, () => {});
+  } catch { /* pannello non disponibile */ }
+}
+
 function sendMessage(text) {
-  sendQueue = sendQueue.then(async () => {
-    if (!connected()) return;
-    await vscode.env.clipboard.writeText(text);
-    // Prima di OGNI invio si naviga la webview di Codex sulla conversazione scelta
-    // (rotta interna /local/<uuid> via URI handler): se la chat non è aperta si apre,
-    // se il pannello era altrove ci torna. Poi si incolla nel suo composer.
-    try {
-      await vscode.env.openExternal(vscode.Uri.parse(`vscode://openai.chatgpt/local/${connectedUuid}`));
-    } catch (e) { log(`Navigazione chat fallita: ${e.message}`); }
-    await new Promise((r) => setTimeout(r, 700));
-    await new Promise((res) => {
-      const p = spawn("powershell.exe", [
-        "-NoProfile", "-STA", "-Command",
-        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^v{ENTER}')",
-      ], { stdio: "ignore", windowsHide: true });
-      p.on("close", res);
-      p.on("error", res);
-      setTimeout(res, 3000);
+  sendQueue = sendQueue.then(() => new Promise((resolve) => {
+    if (!connected()) { resolve(); return; }
+    let exe;
+    try { exe = findCodexExe(); } catch (e) { setStatusError(e.message); resolve(); return; }
+    const uuid = connectedUuid;
+    log("Invio alla chat (indipendente dal tuo cursore)");
+    const child = spawn(exe, ["exec", "resume", "--skip-git-repo-check", uuid, text], {
+      cwd: connectedCwd && fs.existsSync(connectedCwd) ? connectedCwd : undefined,
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
     });
-    if (codexWatch) {
-      codexWatch.afterSendUntil = Date.now() + 20000; // finestra per agganciare il file che cresce
-      codexWatch.sendDetected = false;
-      setTimeout(() => {
-        const w = codexWatch;
-        if (w && !w.sendDetected && connected()) {
-          // L'invio non è atterrato: il testo NON si perde — torna in bozza.
-          pendingTexts.unshift(text);
-          log("Invio non atterrato in chat: testo rimesso in bozza");
-          speakChain = speakChain.then(() => playTts("Non vedo la chat muoversi: ho tenuto il messaggio da parte, riprovo a dirlo con invia.")).catch(() => {});
-        }
-      }, 15000);
-    }
-    log("Inviato nel pannello Codex");
-  }).catch(() => {});
+    execChild = child;
+    let errTail = "";
+    child.stderr.on("data", (d) => { errTail = (errTail + d.toString()).slice(-400); });
+    // Poco dopo la partenza il rollout contiene già il TUO messaggio: refresh del pannello.
+    setTimeout(() => { if (connected() && connectedUuid === uuid) refreshPanel(uuid); }, 1500);
+    const killer = setTimeout(() => { try { child.kill(); } catch {} }, 30 * 60 * 1000);
+    child.on("close", (code) => {
+      clearTimeout(killer);
+      if (execChild === child) execChild = null;
+      if (code === 0) {
+        log("Turno completato");
+        if (connected() && connectedUuid === uuid) refreshPanel(uuid);
+      } else if (connected()) {
+        log(`Invio fallito (exit ${code}): ${errTail.split("\n").slice(-2).join(" ")}`);
+        pendingTexts.unshift(text); // mai perdere nulla: torna in bozza
+        speakChain = speakChain.then(() => playTts("Non sono riuscito a inviare: tengo il messaggio da parte, dimmi invia per riprovare.")).catch(() => {});
+      }
+      resolve();
+    });
+    child.on("error", (e) => {
+      clearTimeout(killer);
+      if (execChild === child) execChild = null;
+      log(`Invio fallito: ${e.message}`);
+      resolve();
+    });
+  })).catch(() => {});
   return Promise.resolve();
 }
 
@@ -875,6 +885,7 @@ function stopAll() {
   pendingTexts = [];
   hoChiestoSeFinito = false;
   clearTimeout(pendingSendTimer);
+  if (execChild) { try { execChild.kill(); } catch {} execChild = null; }
   for (const p of allPlayers) { try { p.kill(); } catch {} }
   allPlayers.clear();
   playbackProc = null;
